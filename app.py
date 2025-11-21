@@ -1,12 +1,20 @@
-import time
 import streamlit as st
-from qdrant_client import QdrantClient, models
+import os
+from qdrant_client import QdrantClient
 from fastembed import TextEmbedding
-import httpx
+from openai import OpenAI
+import fitz  # PyMuPDF
+from docx import Document
+import tempfile
+import re
+from typing import List, Dict, Tuple
+import uuid
+from qdrant_client.models import PointStruct
+from datetime import datetime
 
-# Page configuration
+# Page config
 st.set_page_config(
-    page_title="Corporate Knowledge RAG",
+    page_title="Corporate Knowledge RAG System",
     page_icon="📚",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -14,317 +22,483 @@ st.set_page_config(
 
 # Custom CSS
 st.markdown("""
-    <style>
+<style>
     .main-header {
         font-size: 2.5rem;
         font-weight: bold;
         color: #1f77b4;
         text-align: center;
-        margin-bottom: 0.5rem;
+        padding: 1rem 0;
     }
-    .sub-header {
-        text-align: center;
-        color: #666;
-        margin-bottom: 2rem;
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 2rem;
     }
-    .source-box {
-        background-color: #f0f2f6;
+    .stTabs [data-baseweb="tab"] {
+        padding: 1rem 2rem;
+    }
+    .success-box {
         padding: 1rem;
-        border-radius: 0.5rem;
-        margin: 0.5rem 0;
-        border-left: 4px solid #1f77b4;
+        background-color: #d4edda;
+        border-left: 5px solid #28a745;
+        border-radius: 5px;
+        margin: 1rem 0;
     }
-    </style>
-    """, unsafe_allow_html=True)
+    .info-box {
+        padding: 1rem;
+        background-color: #d1ecf1;
+        border-left: 5px solid #17a2b8;
+        border-radius: 5px;
+        margin: 1rem 0;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-# Initialize connections with caching
-@st.cache_resource(show_spinner="Initializing clients...")
+# Initialize session state
+if 'chat_history' not in st.session_state:
+    st.session_state.chat_history = []
+if 'uploaded_files_count' not in st.session_state:
+    st.session_state.uploaded_files_count = 0
+
+# Load credentials from Streamlit secrets
+@st.cache_resource
+def load_config():
+    return {
+        "qdrant_url": st.secrets["qdrant"]["url"],
+        "qdrant_api_key": st.secrets["qdrant"]["api_key"],
+        "openrouter_api_key": st.secrets["openrouter"]["api_key"]
+    }
+
+config = load_config()
+
+# Initialize clients
+@st.cache_resource
 def init_clients():
-    """Initialize Qdrant, FastEmbed, and HTTP client"""
+    qdrant = QdrantClient(
+        url=config["qdrant_url"],
+        api_key=config["qdrant_api_key"],
+        timeout=180  # Increase timeout to 180 seconds (3 minutes)
+    )
+    embedding = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
+    llm = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=config["openrouter_api_key"]
+    )
+    return qdrant, embedding, llm
+
+qdrant_client, embedding_model, llm_client = init_clients()
+
+# Document processing functions
+def extract_text_from_pdf(file_bytes) -> Tuple[str, Dict]:
+    """Extract text from PDF bytes"""
     try:
-        # Initialize Qdrant client
-        qdrant_client = QdrantClient(
-            url=st.secrets["QDRANT_URL"],
-            api_key=st.secrets["QDRANT_API_KEY"]
-        )
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        text = ""
+        metadata = {
+            "total_pages": len(doc),
+            "title": doc.metadata.get("title", ""),
+        }
         
-        # Initialize FastEmbed (local, no API needed)
-        embedding_model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
+        for page_num, page in enumerate(doc, start=1):
+            page_text = page.get_text()
+            if page_text.strip():
+                text += f"\n--- Page {page_num} ---\n{page_text}"
         
-        # Initialize HTTP client for OpenRouter
-        http_client = httpx.Client(timeout=30.0)
-        
-        return qdrant_client, embedding_model, http_client
+        doc.close()
+        return text.strip(), metadata
     except Exception as e:
-        st.error(f"Error initializing clients: {e}")
-        st.stop()
+        st.error(f"Error extracting PDF: {e}")
+        return "", {}
 
-# Load clients
-qdrant_client, embedding_model, http_client = init_clients()
-
-def generate_embeddings(text):
-    """Generate embeddings using FastEmbed (local)"""
+def extract_text_from_docx(file_bytes) -> Tuple[str, Dict]:
+    """Extract text from DOCX bytes"""
     try:
-        embeddings = list(embedding_model.embed([text]))
-        return embeddings[0]
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.docx') as tmp_file:
+            tmp_file.write(file_bytes)
+            tmp_path = tmp_file.name
+        
+        doc = Document(tmp_path)
+        text = "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
+        
+        # Extract tables
+        table_text = []
+        for table in doc.tables:
+            for row in table.rows:
+                row_text = " | ".join([cell.text.strip() for cell in row.cells])
+                if row_text.strip():
+                    table_text.append(row_text)
+        
+        if table_text:
+            text += "\n\n--- Tables ---\n" + "\n".join(table_text)
+        
+        os.unlink(tmp_path)
+        
+        metadata = {
+            "paragraphs_count": len(doc.paragraphs),
+            "tables_count": len(doc.tables),
+        }
+        return text.strip(), metadata
     except Exception as e:
-        st.error(f"Embedding error: {e}")
-        raise
+        st.error(f"Error extracting DOCX: {e}")
+        return "", {}
 
-def call_openrouter_llm(prompt, model="anthropic/claude-sonnet-4.5"):
-    """Call OpenRouter API directly using httpx"""
-    try:
-        response = http_client.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {st.secrets['OPENROUTER_API_KEY']}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "http://localhost:8501"
-            },
-            json={
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 1500
+def process_uploaded_file(uploaded_file, domain: str, document_type: str) -> Dict:
+    """Process uploaded file and return structured data"""
+    file_name = uploaded_file.name
+    file_ext = os.path.splitext(file_name)[1].lower()
+    file_bytes = uploaded_file.read()
+    
+    # Extract text
+    if file_ext == '.pdf':
+        text, metadata = extract_text_from_pdf(file_bytes)
+    elif file_ext in ['.docx', '.doc']:
+        text, metadata = extract_text_from_docx(file_bytes)
+    else:
+        st.error(f"Unsupported file type: {file_ext}")
+        return None
+    
+    if not text:
+        st.error(f"No text extracted from {file_name}")
+        return None
+    
+    # Clean text
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    text = re.sub(r' {2,}', ' ', text)
+    
+    return {
+        "text": text,
+        "metadata": {
+            "source": file_name,
+            "domain": domain,
+            "document_type": document_type,
+            "file_type": file_ext,
+            **metadata
+        }
+    }
+
+def chunk_document(text: str, chunk_size: int = 800, overlap: int = 150) -> List[str]:
+    """Split document into overlapping chunks"""
+    chunks = []
+    start = 0
+    text_length = len(text)
+    
+    while start < text_length:
+        end = start + chunk_size
+        chunk = text[start:end]
+        
+        if end < text_length:
+            last_period = chunk.rfind('.')
+            last_newline = chunk.rfind('\n')
+            break_point = max(last_period, last_newline)
+            
+            if break_point > chunk_size * 0.7:
+                chunk = text[start:start + break_point + 1]
+                end = start + break_point + 1
+        
+        chunks.append(chunk.strip())
+        start = end - overlap
+    
+    return [c for c in chunks if len(c) > 50]
+
+def upload_to_qdrant(doc_data: Dict, batch_size: int = 100) -> int:
+    """Upload document chunks to Qdrant with batching for large files"""
+    import time
+    
+    # Chunk document
+    chunks = chunk_document(doc_data["text"])
+    
+    # Generate embeddings
+    embeddings = list(embedding_model.embed(chunks))
+    
+    # Create points
+    points = []
+    for idx, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+        point = PointStruct(
+            id=str(uuid.uuid4()),
+            vector=embedding.tolist(),
+            payload={
+                "text": chunk,
+                "chunk_index": idx,
+                "total_chunks": len(chunks),
+                **doc_data["metadata"]
             }
         )
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"]
-    except httpx.HTTPStatusError as e:
-        st.error(f"HTTP Error: {e.response.status_code}")
-        return f"Error: {e.response.status_code} - {e.response.text[:200]}"
-    except Exception as e:
-        st.error(f"LLM Error: {e}")
-        return f"Error: {str(e)}"
-
-def rag_query(user_question, domain_filter=None, top_k=5, model="anthropic/claude-sonnet-4.5"):
-    """Execute RAG query: retrieve relevant chunks and generate answer"""
-    # Generate query embedding (local, fast)
-    query_embedding = generate_embeddings(user_question)
+        points.append(point)
     
-    # Build query parameters
-    must_conditions = []
+    # Upload in batches to avoid timeout
+    total_uploaded = 0
+    
+    for i in range(0, len(points), batch_size):
+        batch = points[i:i + batch_size]
+        
+        # Retry logic for each batch
+        max_retries = 3
+        for retry in range(max_retries):
+            try:
+                qdrant_client.upsert(
+                    collection_name="corporate_documents",
+                    points=batch,
+                    wait=True
+                )
+                total_uploaded += len(batch)
+                break  # Success, exit retry loop
+            except Exception as e:
+                if retry < max_retries - 1:
+                    time.sleep(2)  # Wait 2 seconds before retry
+                    continue
+                else:
+                    raise Exception(f"Failed to upload batch after {max_retries} retries: {str(e)}")
+    
+    return total_uploaded
+
+def rag_query(question: str, domain_filter: str, model_name: str, top_k: int = 5):
+    """Execute RAG query with corrected Qdrant API"""
+    # Generate query embedding
+    query_embedding = list(embedding_model.embed([question]))[0]
+    
+    # Search in Qdrant with corrected API
     if domain_filter and domain_filter != "All Domains":
-        must_conditions.append(
-            models.FieldCondition(
-                key="domain",
-                match=models.MatchValue(value=domain_filter)
-            )
-        )
+        results = qdrant_client.query_points(
+            collection_name="corporate_documents",
+            query=query_embedding.tolist(),
+            query_filter={
+                "must": [{"key": "domain", "match": {"value": domain_filter}}]
+            },
+            limit=top_k
+        ).points
+    else:
+        results = qdrant_client.query_points(
+            collection_name="corporate_documents",
+            query=query_embedding.tolist(),
+            limit=top_k
+        ).points
     
-    # Execute search
-    search_results = qdrant_client.query_points(
-        collection_name="corporate_documents",
-        query=query_embedding.tolist(),
-        limit=top_k,
-        with_payload=True,
-        query_filter=models.Filter(must=must_conditions) if must_conditions else None
-    )
+    if not results:
+        return "No relevant documents found.", []
     
-    # Format context and sources
-    context_parts = []
-    sources = []
+    # Build context
+    context = "\n\n".join([
+        f"[Source: {r.payload.get('source')}]\n{r.payload.get('text')}" 
+        for r in results
+    ])
     
-    for idx, point in enumerate(search_results.points):
-        payload = point.payload or {}
-        text = payload.get("text", "")
-        context_parts.append(
-            f"[Source {idx+1}] (Relevance: {point.score:.3f})\n"
-            f"Domain: {payload.get('domain', 'N/A')}\n"
-            f"Document: {payload.get('source', 'N/A')}\n"
-            f"Content: {text}\n"
-        )
-        sources.append({
-            "text": text[:200] + "..." if len(text) > 200 else text,
-            "domain": payload.get("domain", "N/A"),
-            "source": payload.get("source", "N/A"),
-            "document_type": payload.get("document_type", "N/A"),
-            "relevance": point.score
-        })
-    
-    if not sources:
-        return "I couldn't find any relevant information in the knowledge base to answer your question.", []
-    
-    context = "\n".join(context_parts)
-    
-    # Create prompt
-    prompt = f"""You are an expert AI assistant specializing in corporate finance, tax law, and corporate regulations.
+    # Generate answer
+    prompt = f"""Based on the following corporate documents, please answer the question.
 
-CONTEXT FROM KNOWLEDGE BASE:
+Context from documents:
 {context}
 
-USER QUESTION: {user_question}
+Question: {question}
 
-INSTRUCTIONS:
-1. Answer the question using ONLY the information provided in the context above
-2. If the context doesn't contain enough information, clearly state that
-3. Cite which source(s) you used (e.g., "According to Source 1...")
-4. Be precise, professional, and comprehensive
-5. For legal/tax matters, remind users to consult professionals
+Please provide a comprehensive answer based on the information in the documents. If the documents don't contain enough information, please say so. Cite the source documents."""
 
-ANSWER:"""
+    response = llm_client.chat.completions.create(
+        model=model_name,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.1
+    )
     
-    # Generate response using direct HTTP call
-    answer = call_openrouter_llm(prompt, model)
+    answer = response.choices[0].message.content
+    sources = [(r.payload.get('source'), r.score) for r in results]
     
     return answer, sources
 
-# Main UI
+# App Header
 st.markdown('<div class="main-header">📚 Corporate Knowledge RAG System</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">AI-powered search for Corporate Finance, Tax, and Law</div>', unsafe_allow_html=True)
 
-# Sidebar
-with st.sidebar:
-    st.header("⚙️ Settings")
+# Create tabs
+tab1, tab2, tab3 = st.tabs(["💬 Query Documents", "📤 Upload Documents", "📊 Collection Stats"])
+
+# TAB 1: Query Documents
+with tab1:
+    st.header("Ask Questions About Your Documents")
     
-    # Domain filter
-    domain_options = ["All Domains", "Accounting & Finance", "Corporate Tax", "Corporate Law"]
-    selected_domain = st.selectbox(
-        "Filter by Domain",
-        domain_options,
-        help="Narrow your search to a specific domain"
+    col1, col2 = st.columns([3, 1])
+    
+    with col1:
+        question = st.text_input(
+            "Enter your question:",
+            placeholder="e.g., Chế độ kế toán TT99 năm 2025 quy định những gì?",
+            key="question_input"
+        )
+    
+    with col2:
+        domain_filter = st.selectbox(
+            "Domain Filter:",
+            ["All Domains", "Corporate Tax", "Accounting & Finance", "Corporate Law & Regulation"],
+            key="domain_filter"
+        )
+    
+    col3, col4, col5 = st.columns(3)
+    
+    with col3:
+        model_choice = st.selectbox(
+            "LLM Model:",
+            [
+                "anthropic/claude-4.5-sonnet",
+                "anthropic/claude-4.5-haiku",
+                "openai/gpt-5-mini",
+                "mistralai/mistral-7b-instruct"
+            ],
+            key="model_choice"
+        )
+    
+    with col4:
+        top_k = st.slider("Number of Sources:", 1, 10, 5, key="top_k")
+    
+    with col5:
+        st.write("")  # Spacing
+        query_button = st.button("🔍 Search", type="primary", use_container_width=True)
+    
+    if query_button and question:
+        with st.spinner("Searching and generating answer..."):
+            try:
+                answer, sources = rag_query(question, domain_filter, model_choice, top_k)
+                
+                # Display answer
+                st.markdown("### 📝 Answer:")
+                st.markdown(f'<div class="info-box">{answer}</div>', unsafe_allow_html=True)
+                
+                # Display sources
+                st.markdown("### 📚 Sources Used:")
+                for i, (source, score) in enumerate(sources, 1):
+                    st.write(f"{i}. **{source}** (Relevance: {score:.4f})")
+                
+                # Add to history
+                st.session_state.chat_history.append({
+                    "question": question,
+                    "answer": answer,
+                    "sources": sources,
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                })
+                
+            except Exception as e:
+                st.error(f"Error: {e}")
+    
+    # Show chat history
+    if st.session_state.chat_history:
+        st.markdown("---")
+        st.markdown("### 📜 Query History")
+        for i, item in enumerate(reversed(st.session_state.chat_history[-5:]), 1):
+            with st.expander(f"Q{len(st.session_state.chat_history)-i+1}: {item['question'][:80]}..."):
+                st.write(f"**Time:** {item['timestamp']}")
+                st.write(f"**Q:** {item['question']}")
+                st.write(f"**A:** {item['answer']}")
+                st.write("**Sources:**")
+                for source, score in item['sources']:
+                    st.write(f"  - {source} ({score:.4f})")
+
+# TAB 2: Upload Documents
+with tab2:
+    st.header("Upload New Documents")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        upload_domain = st.selectbox(
+            "Select Domain:",
+            ["Corporate Tax", "Accounting & Finance", "Corporate Law & Regulation"],
+            key="upload_domain"
+        )
+    
+    with col2:
+        upload_doc_type = st.selectbox(
+            "Document Type:",
+            ["policy", "guideline", "regulation", "standard", "memo", "procedure", "general"],
+            key="upload_doc_type"
+        )
+    
+    uploaded_files = st.file_uploader(
+        "Choose PDF or DOCX files:",
+        type=["pdf", "docx"],
+        accept_multiple_files=True,
+        key="file_uploader"
     )
     
-    # Number of sources
-    num_sources = st.slider(
-        "Number of sources to retrieve",
-        min_value=1,
-        max_value=10,
-        value=5,
-        help="How many relevant document chunks to use"
-    )
+    if uploaded_files:
+        st.info(f"📁 {len(uploaded_files)} file(s) selected")
+        
+        if st.button("📤 Upload to Qdrant", type="primary"):
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            successful = 0
+            failed = 0
+            total_chunks = 0
+            
+            for i, uploaded_file in enumerate(uploaded_files):
+                # Update progress
+                progress_percent = i / len(uploaded_files)
+                progress_bar.progress(progress_percent)
+                status_text.text(f"Processing {i+1}/{len(uploaded_files)}: {uploaded_file.name}")
+                
+                try:
+                    # Show file size info
+                    file_size_kb = len(uploaded_file.getvalue()) / 1024
+                    if file_size_kb > 500:  # If file > 500KB, show warning
+                        st.info(f"⏳ Large file detected ({file_size_kb:.1f}KB). This may take a moment...")
+                    
+                    doc_data = process_uploaded_file(uploaded_file, upload_domain, upload_doc_type)
+                    
+                    if doc_data:
+                        chunks_count = upload_to_qdrant(doc_data)
+                        total_chunks += chunks_count
+                        successful += 1
+                        st.success(f"✅ {uploaded_file.name} ({chunks_count} chunks)")
+                    else:
+                        failed += 1
+                        st.error(f"❌ {uploaded_file.name} - Failed to process")
+                
+                except Exception as e:
+                    failed += 1
+                    st.error(f"❌ {uploaded_file.name} - Error: {e}")
+                
+                progress_bar.progress((i + 1) / len(uploaded_files))
+            
+            status_text.empty()
+            progress_bar.empty()
+            
+            # Summary
+            st.markdown(f"""
+            <div class="success-box">
+                <h4>📊 Upload Summary</h4>
+                <ul>
+                    <li>✅ Successful: {successful}/{len(uploaded_files)} files</li>
+                    <li>❌ Failed: {failed}/{len(uploaded_files)} files</li>
+                    <li>📦 Total chunks created: {total_chunks}</li>
+                </ul>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            st.session_state.uploaded_files_count += successful
+
+# TAB 3: Collection Stats
+with tab3:
+    st.header("Collection Statistics")
     
-    # Model selection
-    model_options = {
-        "Claude 4.5 Sonnet (Recommended)": "anthropic/claude-sonnet-4.5",
-        "Claude 4.5 Haiku (Faster)": "anthropic/claude-haiku-4.5",
-        "GPT-4o Mini (Cheap)": "openai/gpt-4o-mini",
-        "Mistral Large 2": "mistralai/mistral-large-2"
-    }
-    selected_model_name = st.selectbox(
-        "AI Model",
-        list(model_options.keys()),
-        help="Choose the language model for generating answers"
-    )
-    selected_model = model_options[selected_model_name]
-    
-    st.divider()
-    
-    # Information section
-    st.subheader("📋 About")
-    st.write("""
-    This RAG system provides intelligent answers to questions about:
-    - **Accounting & Finance**: GAAP standards, financial statements
-    - **Corporate Tax**: Deductions, documentation requirements
-    - **Corporate Law**: Governance, fiduciary duties
-    
-    **Tech Stack:**
-    - Embeddings: FastEmbed (local, offline)
-    - LLM: OpenRouter API (via httpx)
-    - Vector DB: Qdrant Cloud
-    """)
-    
-    st.info("💡 **Tip**: Be specific in your questions for better results!")
-    
-    st.divider()
-    
-    # Stats
-    st.subheader("📊 System Info")
-    try:
-        collection_info = qdrant_client.get_collection("corporate_documents")
-        st.metric("Documents in Knowledge Base", collection_info.points_count)
-        st.metric("Vector Dimensions", collection_info.config.params.vectors.size)
-    except:
-        st.warning("Unable to fetch collection stats")
-
-# Main query interface
-st.subheader("🔍 Ask a Question")
-
-# Initialize session state for chat history
-if 'chat_history' not in st.session_state:
-    st.session_state.chat_history = []
-
-# Query input
-user_query = st.text_area(
-    "Enter your question:",
-    height=100,
-    placeholder="e.g., What are the required financial statements for public companies?",
-    help="Ask any question about corporate finance, tax, or law"
-)
-
-col1, col2, col3 = st.columns([1, 1, 4])
-
-with col1:
-    search_button = st.button("🔍 Search", type="primary", use_container_width=True)
-
-with col2:
-    clear_button = st.button("🗑️ Clear History", use_container_width=True)
-
-if clear_button:
-    st.session_state.chat_history = []
-    st.rerun()
-
-# Process query
-if search_button and user_query:
-    with st.spinner("🤔 Searching knowledge base and generating answer..."):
+    if st.button("🔄 Refresh Stats"):
         try:
-            answer, sources = rag_query(
-                user_query,
-                domain_filter=selected_domain,
-                top_k=num_sources,
-                model=selected_model
-            )
+            collection_info = qdrant_client.get_collection("corporate_documents")
             
-            # Add to chat history
-            st.session_state.chat_history.insert(0, {
-                "question": user_query,
-                "answer": answer,
-                "sources": sources,
-                "domain": selected_domain,
-                "model": selected_model_name
-            })
+            st.metric("Total Vectors", collection_info.points_count)
+            st.metric("Vector Dimension", collection_info.config.params.vectors.size)
             
+            st.markdown("---")
+            st.subheader("📁 Documents by Domain")
+            
+            for domain in ["Corporate Tax", "Accounting & Finance", "Corporate Law & Regulation"]:
+                results = qdrant_client.scroll(
+                    collection_name="corporate_documents",
+                    scroll_filter={
+                        "must": [{"key": "domain", "match": {"value": domain}}]
+                    },
+                    limit=1000
+                )
+                
+                unique_sources = set([point.payload.get("source") for point in results[0]])
+                
+                with st.expander(f"📂 {domain} ({len(results[0])} chunks, {len(unique_sources)} documents)"):
+                    for source in sorted(unique_sources):
+                        st.write(f"• {source}")
+        
         except Exception as e:
-            st.error(f"Error processing query: {e}")
-
-# Display results
-if st.session_state.chat_history:
-    st.divider()
-    
-    for idx, chat in enumerate(st.session_state.chat_history):
-        with st.expander(f"❓ {chat['question']}", expanded=(idx == 0)):
-            # Question metadata
-            st.caption(f"🎯 Domain: {chat['domain']} | 🤖 Model: {chat['model']}")
-            
-            # Answer
-            st.markdown("### 💡 Answer")
-            st.markdown(chat['answer'])
-            
-            # Sources
-            if chat['sources']:
-                st.markdown("### 📚 Sources")
-                for i, source in enumerate(chat['sources'], 1):
-                    with st.container():
-                        st.markdown(f"""
-                        <div class="source-box">
-                            <strong>[{i}] {source['source']}</strong><br>
-                            <small>Domain: {source['domain']} | Type: {source['document_type']} | Relevance: {source['relevance']:.3f}</small>
-                            <hr style="margin: 0.5rem 0;">
-                            <div style="max-height: 150px; overflow-y: auto;">
-                                {source['text']}
-                            </div>
-                        </div>
-                        """, unsafe_allow_html=True)
-            else:
-                st.info("No sources found for this query.")
-            
-            st.divider()
-
-# Footer
-st.markdown("---")
-st.markdown("""
-<div style="text-align: center; color: #666; font-size: 0.9rem;">
-    <p>⚠️ <strong>Disclaimer:</strong> This system provides information for reference only. 
-    Always consult qualified professionals for legal, tax, and financial advice.</p>
-    <p>Powered by Qdrant • OpenRouter • Streamlit</p>
-</div>
-""", unsafe_allow_html=True)
+            st.error(f"Error fetching stats: {e}")
